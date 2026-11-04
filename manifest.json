@@ -1,27 +1,51 @@
 {
   "manifest_version": 3,
-  "name": "GLaDOS 自动签到助手",
-  "version": "1.4",
-  "description": "每天自动完成 GLaDOS 签到。确保您在当前浏览器中已登录 https://glados.cloud/console/checkin （确保域名正确，否则会签到失败。）",
+  "name": "GLaDOS 自动签到助手 (Firefox)",
+  "version": "1.5",
+  "description": "每天自动完成 GLaDOS 签到。请先在当前浏览器登录 https://glados.rocks/console/checkin （域名必须正确，否则签到会失败）。",
   "permissions": [
     "alarms",
     "storage",
     "notifications",
-	"declarativeNetRequest"
+    "declarativeNetRequestWithHostAccess"
   ],
   "host_permissions": [
-	"https://glados.cloud/*"
+    "https://glados.rocks/*"
   ],
-  "action": {
-    "default_title": "GLaDOS 签到助手"
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "glados-autocheckin@local",
+      "strict_min_version": "140.0",
+      "data_collection_permissions": {
+        "required": [
+          "none"
+        ]
+      }
+    },
+    "gecko_android": {
+      "strict_min_version": "142.0"
+    }
   },
-  "options_page": "options.html",
+  "action": {
+    "default_title": "GLaDOS 签到助手",
+    "default_icon": {
+      "16": "icon-16.png",
+      "48": "icon-48.png",
+      "128": "icon-128.png"
+    }
+  },
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
+  },
   "background": {
-    "service_worker": "background.js"
+    "scripts": [
+      "background.js"
+    ]
   },
   "icons": {
-	"16": "icon.png",
-    "48": "icon.png",
-    "128": "icon.png"
+    "16": "icon-16.png",
+    "48": "icon-48.png",
+    "128": "icon-128.png"
   }
 }
