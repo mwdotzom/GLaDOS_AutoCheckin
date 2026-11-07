@@ -57,6 +57,22 @@ Firefox 正式版默认要求签名。自签名安装步骤：
 
 域名与请求头集中在本仓库 `background.js` 顶部的 `CONFIG` 对象中，换域名只需改这一处。
 
+## v1.6 修复：重启后不再自动签到
+
+`alarms.create()` 原来只在 `onInstalled` 里调用一次。Firefox 的定时闹钟不跨浏览器
+重启保留，所以装好之后的第一次重启起，就没有任何定时器会再触发签到；当天唯一会跑的
+是 `onStartup` 的一次性检查，如果那时还没到目标小时（默认 9 点），这一天就完全不会有
+自动签到。手动测试能成功，说明请求本身（cookie、Origin/Referer 伪装、域名、token）
+都是好的。
+
+改动：
+
+- 新增 `ensureAlarm()`：先 `alarms.get()`，只在确实缺失时创建，避免在回调里重建把周期重置掉。
+- `onInstalled`、`onStartup`、`onAlarm` 三条路径都会确保闹钟存在；`onStartup` 同时重注册伪装规则。
+- 手动测试成功时同样写入 `lastCheckInDate`，否则同一天还会再自动签到一次。
+- `scripts/test-background.mjs`：在 vm 里用 stub 的 `browser.*` 跑真实 `background.js`，覆盖以上 11 条行为。`node scripts/test-background.mjs`。
+
+
 ## 📂 文件结构
 
 - `manifest.json` — 扩展配置（MV3，Firefox 形式）。

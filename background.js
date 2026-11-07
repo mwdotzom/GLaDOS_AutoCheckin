@@ -50,21 +50,42 @@ async function installHeaderRules() {
 }
 
 // ---------------------------------------------------------------- 生命周期
+// ---------------------------------------------------------------- 生命周期
+// Firefox 的 alarms 不会跨浏览器重启保留，而 onInstalled 只在安装那一次触发。
+// 所以闹钟必须在每次启动时重建，否则重启后再也没有定时签到。
+// 这里只在确实缺失时创建，避免在闹钟回调里重建导致周期被重置。
+async function ensureAlarm() {
+  try {
+    const existing = await api.alarms.get("checkInAlarm");
+    if (existing) return;
+    await api.alarms.create("checkInAlarm", {
+      delayInMinutes: 1,
+      periodInMinutes: 60
+    });
+    console.log("[闹钟] 已创建：1 分钟后开始，每 60 分钟一次");
+  } catch (error) {
+    console.error("[闹钟] 创建失败:", error);
+  }
+}
+
 api.runtime.onInstalled.addListener(() => {
   console.log("插件已安装，配置伪装规则...");
   installHeaderRules();
-  api.alarms.create("checkInAlarm", { delayInMinutes: 1, periodInMinutes: 60 });
+  ensureAlarm();
   tryCheckIn();
 });
 
 api.runtime.onStartup.addListener(() => {
-  console.log("检测到浏览器启动，开始检查签到条件...");
+  console.log("检测到浏览器启动，重建定时任务并检查签到条件...");
+  installHeaderRules();
+  ensureAlarm();
   tryCheckIn();
 });
 
 api.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === "checkInAlarm") {
     console.log("定时闹钟触发，开始检查签到条件...");
+    ensureAlarm();
     tryCheckIn();
   }
 });
@@ -105,6 +126,20 @@ async function tryCheckIn() {
   }
 }
 
+/**
+ * 服务端是否认为本次签到已经完成（成功、或已是今日签到）。
+ * 判定标准沿用原版：code === 0 或消息里出现这些关键词。
+ */
+function looksDone(result, statusMsg) {
+  const msgLower = String(statusMsg).toLowerCase();
+  return (
+    result.code === 0 ||
+    ["checkin", "points", "repeat", "tomorrow", "logged"].some((word) =>
+      msgLower.includes(word)
+    )
+  );
+}
+
 async function performFetch(today, notifyEnabled, isManual = false) {
   const tag = isManual ? "手动" : "自动";
   let statusMsg;
@@ -123,19 +158,16 @@ async function performFetch(today, notifyEnabled, isManual = false) {
     statusMsg = result.message || `HTTP ${response.status}`;
     await saveHistory(`[${tag}] ${statusMsg}`);
 
-    if (!isManual) {
-      const msgLower = String(statusMsg).toLowerCase();
-      const done =
-        result.code === 0 ||
-        ["checkin", "points", "repeat", "tomorrow", "logged"].some((word) =>
-          msgLower.includes(word)
-        );
-      if (done) {
-        await api.storage.local.set({ lastCheckInDate: today });
-        console.log("已更新自动签到日期标识");
-      }
+    // 手动测试同样写入今日标记，否则同一天还会再自动签到一次。
+    if (looksDone(result, statusMsg)) {
+      await api.storage.local.set({ lastCheckInDate: today });
+      console.log(
+        isManual
+          ? "手动测试成功，已更新今日签到标记"
+          : "已更新自动签到日期标识"
+      );
     } else {
-      console.log("本次为手动测试，不更新自动签到日期标识");
+      console.log(`签到未完成（${statusMsg}），保持今日标记不变`);
     }
   } catch (error) {
     console.error("网络请求发生错误:", error);
