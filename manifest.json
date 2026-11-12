@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "GLaDOS 自动签到助手 (Firefox)",
-  "version": "1.6",
-  "description": "每天自动完成 GLaDOS 签到。请先在当前浏览器登录 https://glados.rocks/console/checkin （域名必须正确，否则签到会失败）。",
+  "version": "1.7",
+  "description": "每天自动完成 GLaDOS 签到（带挑战 nonce + proof）。请先在当前浏览器登录 https://glados.rocks/console/checkin 。",
   "permissions": [
     "alarms",
     "storage",

@@ -73,6 +73,25 @@ Firefox 正式版默认要求签名。自签名安装步骤：
 - `scripts/test-background.mjs`：在 vm 里用 stub 的 `browser.*` 跑真实 `background.js`，覆盖以上 11 条行为。`node scripts/test-background.mjs`。
 
 
+## v1.7：补上挑战 nonce + proof（修复“每天只有 1 分”）
+
+站点改版后，`POST /api/user/checkin` 只带 `token` 会被判为自动签到，只给最低分。
+站点前端 `console/checkin` 的真实流程（从 `static/js` 里读出来的）：
+
+```
+GET  /api/user/checkin/challenge   -> { code, nonce, ttl, turnstile? }
+等待 >= 2500ms（前端硬编码的节流）
+proof = SHA-256(nonce + "." + "glados-observe-v1")
+POST /api/user/checkin  { token: <站点 hostname>, nonce, proof, tsState }
+```
+
+- salt 在前端被打散成字符码数组（`103,108,97,...`），解码即 `glados-observe-v1`。
+- `token` 取 `window.location.hostname`，本扩展固定为 `glados.rocks`。
+- `tsState` 取值 `off / ok / timeout / error`；挑战未要求验证时前端报 `off`。
+  后台页面渲染不了 Turnstile，所以要求验证时如实报 `timeout`，服务端回
+  `reason:"turnstile"`，扩展提示去官网手动签一次。
+- 另外识别 `code:4 + reason:"device-mismatch"`、`repeated`、`points`、`streak`、`list[0].balance`。
+
 ## 📂 文件结构
 
 - `manifest.json` — 扩展配置（MV3，Firefox 形式）。

@@ -5,17 +5,34 @@
 //   2. 全部改用 browser.* Promise API（Firefox 的 chrome.* 只支持回调，
 //      原版 `await chrome.storage.local.get(...)` 在 Firefox 上会拿到 undefined）。
 //   3. 域名集中在 CONFIG 里，glados.cloud → glados.rocks 改一处即可。
+//
+// 2026-11 起站点要求签到请求携带一次性的 nonce + proof（见 CONFIG.PROOF_SALT），
+// 否则会被判定为自动签到，只给最低分。流程照抄站点前端 /console/checkin：
+//   GET  /api/user/checkin/challenge  -> { code, nonce, ttl, turnstile? }
+//   等待 >= 2500ms（前端就是这么节流的）
+//   proof = SHA-256(nonce + "." + salt)
+//   POST /api/user/checkin  { token: 站点 hostname, nonce, proof, tsState }
 
 const CONFIG = {
   ORIGIN: "https://glados.rocks",
+  API: "https://glados.rocks/api",
+  CHALLENGE_URL: "https://glados.rocks/api/user/checkin/challenge",
   CHECKIN_URL: "https://glados.rocks/api/user/checkin",
   CHECKIN_PAGE: "https://glados.rocks/console/checkin",
-  // 请求体里的 token 与站点域名一致，这是原版的约定。
+  // 站点前端把 proof 的盐做成了字符码数组，解码后是下面这个字符串。
+  PROOF_SALT: "glados-observe-v1",
+  // 请求体里的 token 是前端 location.hostname，扩展里没有站点 location，只能照抄。
   TOKEN: "glados.rocks",
+  MIN_CHALLENGE_MS: 2500,
+  CHALLENGE_TTL_FALLBACK_MS: 300000,
+  REQUEST_TIMEOUT_MS: 30000,
+  MAX_ATTEMPTS: 3,
   RULE_ID: 1
 };
 
 const api = typeof browser !== "undefined" ? browser : chrome;
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // ---------------------------------------------------------------- 请求头伪装
 // 让 /api/user/checkin 的请求带上站点自己的 Origin / Referer，
@@ -32,7 +49,7 @@ async function installHeaderRules() {
       ]
     },
     condition: {
-      urlFilter: `${CONFIG.ORIGIN}/api/user/checkin`,
+      urlFilter: `${CONFIG.ORIGIN}/api/`,
       resourceTypes: ["xmlhttprequest"]
     }
   }];
@@ -49,7 +66,118 @@ async function installHeaderRules() {
   }
 }
 
-// ---------------------------------------------------------------- 生命周期
+// ---------------------------------------------------------------- HTTP
+async function requestJson(url, options = {}) {
+  let lastError;
+  for (let attempt = 1; attempt <= CONFIG.MAX_ATTEMPTS; attempt++) {
+    try {
+      const response = await fetch(url, {
+        credentials: "include",
+        headers: {
+          Accept: "application/json, text/plain, */*",
+          "Content-Type": "application/json;charset=UTF-8",
+          ...(options.headers || {})
+        },
+        ...options,
+        signal:
+          typeof AbortSignal !== "undefined" && AbortSignal.timeout
+            ? AbortSignal.timeout(CONFIG.REQUEST_TIMEOUT_MS)
+            : undefined
+      });
+      const text = await response.text();
+      if (!response.ok) {
+        const error = new Error(`HTTP ${response.status}: ${text.slice(0, 200)}`);
+        error.retryable = [502, 503, 504].includes(response.status);
+        throw error;
+      }
+      try {
+        return text ? JSON.parse(text) : {};
+      } catch {
+        throw new Error(`响应不是有效 JSON: ${text.slice(0, 200)}`);
+      }
+    } catch (error) {
+      lastError = error;
+      const retryable =
+        error.retryable ||
+        error.name === "TypeError" ||
+        error.name === "TimeoutError" ||
+        error.name === "AbortError";
+      if (!retryable || attempt === CONFIG.MAX_ATTEMPTS) break;
+      await sleep(1000 * attempt);
+    }
+  }
+  throw lastError;
+}
+
+function unauthorizedMessage(data) {
+  const message = String(data?.message || "");
+  if (
+    Number(data?.code) === -2 ||
+    message.includes("没有权限") ||
+    message.toLowerCase().includes("unauthorized")
+  )
+    return "未登录或登录已过期，请在浏览器里打开 glados.rocks 重新登录";
+  return null;
+}
+
+async function sha256Hex(text) {
+  const buffer = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(text)
+  );
+  return Array.from(new Uint8Array(buffer))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+/**
+ * 取一次签到挑战。
+ * 站点的挑战没有 turnstile 时，前端直接报 tsState:"off"，不弹验证码。
+ */
+async function fetchChallenge() {
+  const data = await requestJson(CONFIG.CHALLENGE_URL, { method: "GET" });
+  const unauthorized = unauthorizedMessage(data);
+  if (unauthorized) throw new Error(unauthorized);
+  if (Number(data.code) !== 0 || !data.nonce)
+    throw new Error(`未能获取签到挑战: ${data.message || data.code}`);
+  return {
+    nonce: data.nonce,
+    ttl: Number(data.ttl) || CONFIG.CHALLENGE_TTL_FALLBACK_MS,
+    at: Date.now(),
+    turnstile: data.turnstile || null
+  };
+}
+
+/**
+ * 按站点前端的顺序构造签到请求体：
+ * 取 nonce → 等够 2500ms → 算 proof → 带 tsState。
+ *
+ * tsState 取值与站点一致：off（挑战没要求验证）/ ok / timeout / error。
+ * 后台页面无法渲染 Turnstile 组件，所以要求验证时只能如实报 timeout，
+ * 由服务端回 reason:"turnstile"，再提示用户去官网手动签一次。
+ */
+async function buildCheckinBody() {
+  const challenge = await fetchChallenge();
+  const tsState = challenge.turnstile ? "timeout" : "off";
+
+  const remaining = CONFIG.MIN_CHALLENGE_MS - (Date.now() - challenge.at);
+  if (remaining > 0) {
+    console.log(`[挑战] 等待 ${remaining}ms 以满足站点的节流`);
+    await sleep(remaining);
+  }
+
+  const proof = await sha256Hex(`${challenge.nonce}.${CONFIG.PROOF_SALT}`);
+  return {
+    body: {
+      token: CONFIG.TOKEN,
+      nonce: challenge.nonce,
+      proof,
+      tsState
+    },
+    needsTurnstile: Boolean(challenge.turnstile)
+  };
+}
+
 // ---------------------------------------------------------------- 生命周期
 // Firefox 的 alarms 不会跨浏览器重启保留，而 onInstalled 只在安装那一次触发。
 // 所以闹钟必须在每次启动时重建，否则重启后再也没有定时签到。
@@ -116,7 +244,7 @@ async function tryCheckIn() {
     );
 
     if (data.lastCheckInDate !== today && currentHour >= targetHour) {
-      console.log("满足自动签到条件，准备发送请求...");
+      console.log("满足自动签到条件，准备获取挑战并签到...");
       await performFetch(today, data.notifyEnabled, false);
     } else {
       console.log("未满足自动签到条件，继续等待。");
@@ -127,66 +255,112 @@ async function tryCheckIn() {
 }
 
 /**
- * 服务端是否认为本次签到已经完成（成功、或已是今日签到）。
- * 判定标准沿用原版：code === 0 或消息里出现这些关键词。
+ * 把服务端返回解析成统一结果。
+ * 站点会用到：code / message / reason / points / streak / repeated / list[0].balance。
  */
-function looksDone(result, statusMsg) {
-  const msgLower = String(statusMsg).toLowerCase();
-  return (
-    result.code === 0 ||
-    ["checkin", "points", "repeat", "tomorrow", "logged"].some((word) =>
-      msgLower.includes(word)
-    )
-  );
+function describeResult(result, needsTurnstile) {
+  const message = String(result?.message || "").trim();
+  const code = Number(result?.code);
+  const reason = String(result?.reason || "");
+  const balance = parseFloat(result?.list?.[0]?.balance);
+  const balanceText = Number.isFinite(balance)
+    ? `，当前余额 ${Math.floor(balance)} 积分`
+    : "";
+  const pointsText =
+    result?.points != null ? `，获得 ${result.points} 积分` : "";
+  const streakText =
+    result?.streak != null ? `，连签 ${result.streak} 天` : "";
+
+  if (code === 4 && reason === "device-mismatch")
+    return {
+      ok: false,
+      needsManual: true,
+      text: "登录设备与签到设备不一致，请重新登录 glados.rocks"
+    };
+
+  if (reason === "turnstile" || (needsTurnstile && code !== 0))
+    return {
+      ok: false,
+      needsManual: true,
+      text: "站点要求人机验证，请在官网手动签到一次以解除"
+    };
+
+  if (
+    message.includes("Checkin Repeats") ||
+    message.includes("Please Try Tomorrow") ||
+    result?.repeated === true
+  )
+    return { ok: true, text: `今日已签到${balanceText}` };
+
+  if (
+    code === 0 ||
+    message.includes("Today's observation logged") ||
+    message.includes("Checkin! Got")
+  )
+    return {
+      ok: true,
+      text: `签到成功${pointsText}${streakText}${balanceText}`
+    };
+
+  return { ok: false, text: `未知结果: ${message || code}` };
 }
 
 async function performFetch(today, notifyEnabled, isManual = false) {
   const tag = isManual ? "手动" : "自动";
-  let statusMsg;
+  let outcome;
 
   try {
-    const response = await fetch(CONFIG.CHECKIN_URL, {
+    const { body, needsTurnstile } = await buildCheckinBody();
+    console.log(`[${tag}] 挑战已获取，提交签到`);
+    const result = await requestJson(CONFIG.CHECKIN_URL, {
       method: "POST",
-      headers: { "Content-Type": "application/json;charset=UTF-8" },
-      credentials: "include",
-      body: JSON.stringify({ token: CONFIG.TOKEN })
+      body: JSON.stringify(body)
     });
+    console.log(`[${tag}] 服务器返回完整结果:`, result);
 
-    const result = await response.json();
-    console.log(`[${tag}测试] 服务器返回完整结果:`, result);
-
-    statusMsg = result.message || `HTTP ${response.status}`;
-    await saveHistory(`[${tag}] ${statusMsg}`);
-
-    // 手动测试同样写入今日标记，否则同一天还会再自动签到一次。
-    if (looksDone(result, statusMsg)) {
-      await api.storage.local.set({ lastCheckInDate: today });
-      console.log(
-        isManual
-          ? "手动测试成功，已更新今日签到标记"
-          : "已更新自动签到日期标识"
-      );
+    const unauthorized = unauthorizedMessage(result);
+    if (unauthorized) {
+      outcome = { ok: false, text: unauthorized };
     } else {
-      console.log(`签到未完成（${statusMsg}），保持今日标记不变`);
+      outcome = describeResult(result, needsTurnstile);
     }
   } catch (error) {
-    console.error("网络请求发生错误:", error);
-    statusMsg = "网络连接失败";
-    await saveHistory(`[${tag}] ${statusMsg}`);
+    console.error(`[${tag}] 签到失败:`, error);
+    outcome = { ok: false, text: error.message || "网络连接失败" };
   }
 
-  if (notifyEnabled !== false && statusMsg) {
+  await saveHistory(`[${tag}] ${outcome.text}${outcome.ok ? "" : ""}`);
+
+  // 手动测试同样写入今日标记，否则同一天还会再自动签到一次。
+  if (outcome.ok) {
+    await api.storage.local.set({ lastCheckInDate: today });
+    console.log(
+      isManual ? "手动测试成功，已更新今日签到标记" : "已更新自动签到日期标识"
+    );
+  } else {
+    console.log(`签到未完成（${outcome.text}），保持今日标记不变`);
+  }
+
+  if (notifyEnabled !== false && outcome.text) {
     try {
       await api.notifications.create({
         type: "basic",
         iconUrl: api.runtime.getURL("icon-128.png"),
-        title: isManual ? "GLaDOS 手动测试结果" : "GLaDOS 自动签到结果",
-        message: statusMsg
+        title: outcome.ok
+          ? isManual
+            ? "GLaDOS 手动测试结果"
+            : "GLaDOS 自动签到结果"
+          : outcome.needsManual
+            ? "GLaDOS 需要你手动签到一次"
+            : "GLaDOS 签到未成功",
+        message: outcome.text
       });
     } catch (error) {
       console.error("发送通知失败:", error);
     }
   }
+
+  return outcome;
 }
 
 async function saveHistory(msg) {
@@ -207,8 +381,10 @@ api.runtime.onMessage.addListener((request) => {
     console.log("收到强制签到指令");
     const today = localToday();
     return api.storage.local.get(["notifyEnabled"]).then((data) =>
-      performFetch(today, data.notifyEnabled, true).then(() => ({
-        status: "done"
+      performFetch(today, data.notifyEnabled, true).then((outcome) => ({
+        status: "done",
+        ok: Boolean(outcome && outcome.ok),
+        text: outcome ? outcome.text : ""
       }))
     );
   }
